@@ -18,6 +18,9 @@ const PERIOD_TIMES: Record<number, { startTime: string; endTime: string }> = {
 const WEEK_DAYS = [1, 2, 3, 4, 5]
 const PERIODS = [1, 2, 3, 4, 5, 6, 7, 8]
 
+type WeekType = 'even' | 'odd' | 'both'
+type SubjectCategory = 'hard' | 'pe' | 'normal'
+
 function mapLesson(lesson: Lesson & { class?: Class; teacher?: Teacher; subject?: Subject }) {
   const classModel = lesson.get('class') as Class | undefined
   const teacher = lesson.get('teacher') as Teacher | undefined
@@ -57,18 +60,139 @@ async function fetchLessons(where: Record<string, unknown>) {
   )
 }
 
-async function getDaysOrderedByClassLoad(classId: number): Promise<number[]> {
-  const counts = await Promise.all(
-    WEEK_DAYS.map((dayOfWeek) =>
-      Lesson.count({
-        where: { classId, dayOfWeek }
-      })
-    )
-  )
+function normalizeSubjectName(name: string): string {
+  return name.trim().toLowerCase()
+}
 
+function getSubjectCategory(subjectName: string): SubjectCategory {
+  const normalized = normalizeSubjectName(subjectName)
+
+  const peMarkers = ['физкульт', 'физра']
+  if (peMarkers.some((marker) => normalized.includes(marker))) {
+    return 'pe'
+  }
+
+  const hardMarkers = [
+    'матем',
+    'алгебр',
+    'геометр',
+    'русск',
+    'физик',
+    'хим',
+    'информ'
+  ]
+
+  if (hardMarkers.some((marker) => normalized.includes(marker))) {
+    return 'hard'
+  }
+
+  return 'normal'
+}
+
+function getDayPreferencePenalty(category: SubjectCategory, dayOfWeek: number): number {
+  switch (category) {
+    case 'hard': {
+      // Сложные предметы лучше в середине недели
+      const penalties: Record<number, number> = {
+        1: 3,
+        2: 0,
+        3: 0,
+        4: 1,
+        5: 4
+      }
+      return penalties[dayOfWeek] ?? 2
+    }
+
+    case 'pe': {
+      // Физкультура чаще нормально смотрится ближе к концу недели
+      const penalties: Record<number, number> = {
+        1: 3,
+        2: 2,
+        3: 1,
+        4: 0,
+        5: 0
+      }
+      return penalties[dayOfWeek] ?? 1
+    }
+
+    default: {
+      const penalties: Record<number, number> = {
+        1: 1,
+        2: 0,
+        3: 0,
+        4: 0,
+        5: 1
+      }
+      return penalties[dayOfWeek] ?? 1
+    }
+  }
+}
+
+function getPeriodPreferencePenalty(category: SubjectCategory, period: number): number {
+  switch (category) {
+    case 'hard': {
+      // Сложные предметы лучше на 2–4 уроках
+      const penalties: Record<number, number> = {
+        1: 2,
+        2: 0,
+        3: 0,
+        4: 1,
+        5: 3,
+        6: 6,
+        7: 10,
+        8: 14
+      }
+      return penalties[period] ?? 10
+    }
+
+    case 'pe': {
+      // Физкультура лучше не в самом начале и не в самом конце
+      const penalties: Record<number, number> = {
+        1: 8,
+        2: 5,
+        3: 2,
+        4: 0,
+        5: 0,
+        6: 1,
+        7: 4,
+        8: 7
+      }
+      return penalties[period] ?? 4
+    }
+
+    default: {
+      const penalties: Record<number, number> = {
+        1: 2,
+        2: 1,
+        3: 0,
+        4: 0,
+        5: 1,
+        6: 2,
+        7: 4,
+        8: 6
+      }
+      return penalties[period] ?? 3
+    }
+  }
+}
+
+async function getClassDayLoadMap(classId: number): Promise<Map<number, number>> {
+  const map = new Map<number, number>()
+
+  for (const day of WEEK_DAYS) {
+    const count = await Lesson.count({
+      where: { classId, dayOfWeek: day }
+    })
+    map.set(day, count)
+  }
+
+  return map
+}
+
+function getDaysOrderedByClassLoadFromMap(dayLoadMap: Map<number, number>): number[] {
   return [...WEEK_DAYS].sort((a, b) => {
-    const countA = counts[a - 1]
-    const countB = counts[b - 1]
+    const countA = dayLoadMap.get(a) || 0
+    const countB = dayLoadMap.get(b) || 0
     return countA - countB || a - b
   })
 }
@@ -94,8 +218,6 @@ function buildPreferredDays(hoursPerWeek: number, orderedDays: number[]): number
     return result
   }
 
-  // Если часов больше, чем дней, сначала даём по одному часу на каждый день,
-  // потом повторяем цикл по дням.
   while (result.length < hoursPerWeek) {
     for (const day of orderedDays) {
       if (result.length >= hoursPerWeek) break
@@ -107,7 +229,7 @@ function buildPreferredDays(hoursPerWeek: number, orderedDays: number[]): number
 }
 
 async function hasSameSubjectForClassInDay(classId: number, subjectId: number, dayOfWeek: number) {
-  const sameSubjectCount = await Lesson.count({
+  const count = await Lesson.count({
     where: {
       classId,
       subjectId,
@@ -115,24 +237,58 @@ async function hasSameSubjectForClassInDay(classId: number, subjectId: number, d
     }
   })
 
-  return sameSubjectCount > 0
+  return count > 0
 }
 
-async function findAvailableSlotForDay(
+async function hasAdjacentSameSubject(
+  classId: number,
+  subjectId: number,
+  dayOfWeek: number,
+  period: number
+) {
+  const adjacentPeriods = [period - 1, period + 1].filter((value) => value >= 1 && value <= 8)
+
+  if (adjacentPeriods.length === 0) return false
+
+  const count = await Lesson.count({
+    where: {
+      classId,
+      subjectId,
+      dayOfWeek,
+      period: { [Op.in]: adjacentPeriods }
+    }
+  })
+
+  return count > 0
+}
+
+async function findCandidateSlotsForDay(
   classId: number,
   teacherId: number,
   subjectId: number,
+  subjectName: string,
   room: string,
   dayOfWeek: number,
-  weekType: 'even' | 'odd' | 'both' = 'both',
+  dayLoadMap: Map<number, number>,
+  weekType: WeekType = 'both',
   allowSameSubjectInDay = false
 ) {
+  const category = getSubjectCategory(subjectName)
+
   if (!allowSameSubjectInDay) {
     const alreadyHasThisSubject = await hasSameSubjectForClassInDay(classId, subjectId, dayOfWeek)
     if (alreadyHasThisSubject) {
-      return null
+      return []
     }
   }
+
+  const candidates: Array<{
+    dayOfWeek: number
+    period: number
+    startTime: string
+    endTime: string
+    score: number
+  }> = []
 
   for (const period of PERIODS) {
     try {
@@ -144,88 +300,155 @@ async function findAvailableSlotForDay(
         period,
         weekType
       })
-
-      return {
-        dayOfWeek,
-        period,
-        ...PERIOD_TIMES[period]
-      }
     } catch {
-      // этот слот занят, пробуем следующий
+      continue
     }
+
+    // Физкультура не должна идти подряд
+    if (category === 'pe') {
+      const hasAdjacentPe = await hasAdjacentSameSubject(classId, subjectId, dayOfWeek, period)
+      if (hasAdjacentPe) {
+        continue
+      }
+    }
+
+    let score = 0
+
+    // Чем больше уроков уже в этом дне, тем хуже
+    const dayLoad = dayLoadMap.get(dayOfWeek) || 0
+    score += dayLoad * 10
+
+    // Предпочтения по дню и уроку
+    score += getDayPreferencePenalty(category, dayOfWeek) * 4
+    score += getPeriodPreferencePenalty(category, period) * 3
+
+    // Дополнительные "школьные" штрафы
+    if (category === 'hard' && period >= 6) {
+      score += 12
+    }
+
+    if (category === 'pe' && (period === 1 || period === 8)) {
+      score += 10
+    }
+
+    // Сильно перегруженные дни делаем менее привлекательными
+    if (dayLoad >= 6) {
+      score += 20
+    }
+
+    candidates.push({
+      dayOfWeek,
+      period,
+      startTime: PERIOD_TIMES[period].startTime,
+      endTime: PERIOD_TIMES[period].endTime,
+      score
+    })
   }
 
-  return null
+  return candidates
 }
 
 async function findBestAvailableSlot(
   classId: number,
   teacherId: number,
   subjectId: number,
+  subjectName: string,
   room: string,
   preferredDay: number,
-  weekType: 'even' | 'odd' | 'both' = 'both'
+  dayLoadMap: Map<number, number>,
+  weekType: WeekType = 'both'
 ) {
-  // 1. Сначала пытаемся поставить в целевой день без повторения предмета в этот день
-  let slot = await findAvailableSlotForDay(
+  const orderedDays = getDaysOrderedByClassLoadFromMap(dayLoadMap)
+
+  const allCandidates: Array<{
+    dayOfWeek: number
+    period: number
+    startTime: string
+    endTime: string
+    score: number
+  }> = []
+
+  // 1. Сначала любимый день, без повторения предмета в этот день
+  const primaryCandidates = await findCandidateSlotsForDay(
     classId,
     teacherId,
     subjectId,
+    subjectName,
     room,
     preferredDay,
+    dayLoadMap,
     weekType,
     false
   )
-  if (slot) return slot
 
-  // 2. Потом пробуем остальные дни без повторения предмета в день
-  const orderedDays = await getDaysOrderedByClassLoad(classId)
+  for (const candidate of primaryCandidates) {
+    allCandidates.push({ ...candidate, score: candidate.score - 8 })
+  }
+
+  // 2. Потом остальные дни, тоже без повторения предмета
   for (const day of orderedDays) {
     if (day === preferredDay) continue
 
-    slot = await findAvailableSlotForDay(
+    const candidates = await findCandidateSlotsForDay(
       classId,
       teacherId,
       subjectId,
+      subjectName,
       room,
       day,
+      dayLoadMap,
       weekType,
       false
     )
 
-    if (slot) return slot
+    allCandidates.push(...candidates)
   }
 
-  // 3. Если не получилось, разрешаем повтор того же предмета в один день
-  slot = await findAvailableSlotForDay(
-    classId,
-    teacherId,
-    subjectId,
-    room,
-    preferredDay,
-    weekType,
-    true
-  )
-  if (slot) return slot
-
-  // 4. Последняя попытка — любой день, даже если предмет уже есть в этот день
-  for (const day of orderedDays) {
-    if (day === preferredDay) continue
-
-    slot = await findAvailableSlotForDay(
+  // 3. Если не нашли — разрешаем повтор предмета в день
+  if (allCandidates.length === 0) {
+    const fallbackPrimary = await findCandidateSlotsForDay(
       classId,
       teacherId,
       subjectId,
+      subjectName,
       room,
-      day,
+      preferredDay,
+      dayLoadMap,
       weekType,
       true
     )
 
-    if (slot) return slot
+    for (const candidate of fallbackPrimary) {
+      allCandidates.push({ ...candidate, score: candidate.score + 15 })
+    }
+
+    for (const day of orderedDays) {
+      if (day === preferredDay) continue
+
+      const fallbackCandidates = await findCandidateSlotsForDay(
+        classId,
+        teacherId,
+        subjectId,
+        subjectName,
+        room,
+        day,
+        dayLoadMap,
+        weekType,
+        true
+      )
+
+      for (const candidate of fallbackCandidates) {
+        allCandidates.push({ ...candidate, score: candidate.score + 20 })
+      }
+    }
   }
 
-  return null
+  if (allCandidates.length === 0) {
+    return null
+  }
+
+  allCandidates.sort((a, b) => a.score - b.score || a.dayOfWeek - b.dayOfWeek || a.period - b.period)
+  return allCandidates[0]
 }
 
 export class ScheduleController {
@@ -281,7 +504,7 @@ export class ScheduleController {
           period: Number(payload.period),
           startTime: String(payload.startTime),
           endTime: String(payload.endTime),
-          weekType: (payload.weekType || 'both') as 'even' | 'odd' | 'both'
+          weekType: (payload.weekType || 'both') as WeekType
         }
 
         await ensureNoLessonConflict(normalized)
@@ -311,7 +534,7 @@ export class ScheduleController {
         period: req.body.period !== undefined ? Number(req.body.period) : lesson.period,
         startTime: req.body.startTime ?? lesson.startTime,
         endTime: req.body.endTime ?? lesson.endTime,
-        weekType: (req.body.weekType ?? lesson.weekType) as 'even' | 'odd' | 'both'
+        weekType: (req.body.weekType ?? lesson.weekType) as WeekType
       }
 
       await ensureNoLessonConflict({ ...payload, excludeId: lesson.id })
@@ -357,6 +580,12 @@ export class ScheduleController {
         await Lesson.destroy({ where: { classId } })
       }
 
+      const subjects = await Subject.findAll({ attributes: ['id', 'name'] })
+      const subjectNameMap = new Map<number, string>()
+      for (const subject of subjects) {
+        subjectNameMap.set(subject.id, subject.name)
+      }
+
       const existingLessons = await Lesson.findAll({ where: { classId } })
       const existingKeyCount = new Map<string, number>()
 
@@ -364,6 +593,8 @@ export class ScheduleController {
         const key = `${lesson.classId}:${lesson.teacherId}:${lesson.subjectId}`
         existingKeyCount.set(key, (existingKeyCount.get(key) || 0) + 1)
       }
+
+      const dayLoadMap = await getClassDayLoadMap(classId)
 
       const createdLessonIds: number[] = []
       const skipped: Array<{ loadId: number; reason: string }> = []
@@ -375,8 +606,9 @@ export class ScheduleController {
 
         if (missingCount === 0) continue
 
-        const orderedDays = await getDaysOrderedByClassLoad(load.classId)
+        const orderedDays = getDaysOrderedByClassLoadFromMap(dayLoadMap)
         const preferredDays = buildPreferredDays(missingCount, orderedDays)
+        const subjectName = subjectNameMap.get(load.subjectId) || 'Предмет'
 
         for (let index = 0; index < missingCount; index += 1) {
           const preferredDay = preferredDays[index]
@@ -385,8 +617,10 @@ export class ScheduleController {
             load.classId,
             load.teacherId,
             load.subjectId,
+            subjectName,
             load.room || 'Кабинет не указан',
             preferredDay,
+            dayLoadMap,
             'both'
           )
 
@@ -412,6 +646,7 @@ export class ScheduleController {
 
           createdLessonIds.push(lesson.id)
           existingKeyCount.set(key, (existingKeyCount.get(key) || 0) + 1)
+          dayLoadMap.set(slot.dayOfWeek, (dayLoadMap.get(slot.dayOfWeek) || 0) + 1)
         }
       }
 
@@ -425,7 +660,7 @@ export class ScheduleController {
       res.json({
         message:
           createdLessons.length > 0
-            ? 'Занятия автоматически добавлены в сетку класса'
+            ? 'Занятия автоматически распределены по неделе'
             : 'Новые занятия не были созданы',
         createdLessons,
         skipped,
