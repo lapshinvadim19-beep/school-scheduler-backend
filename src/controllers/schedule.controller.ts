@@ -15,6 +15,9 @@ const PERIOD_TIMES: Record<number, { startTime: string; endTime: string }> = {
   8: { startTime: '15:15', endTime: '16:00' }
 }
 
+const WEEK_DAYS = [1, 2, 3, 4, 5]
+const PERIODS = [1, 2, 3, 4, 5, 6, 7, 8]
+
 function mapLesson(lesson: Lesson & { class?: Class; teacher?: Teacher; subject?: Subject }) {
   const classModel = lesson.get('class') as Class | undefined
   const teacher = lesson.get('teacher') as Teacher | undefined
@@ -48,24 +51,180 @@ async function fetchLessons(where: Record<string, unknown>) {
     ],
     order: [['dayOfWeek', 'ASC'], ['period', 'ASC']]
   })
-  return lessons.map((lesson) => mapLesson(lesson as Lesson & { class?: Class; teacher?: Teacher; subject?: Subject }))
+
+  return lessons.map((lesson) =>
+    mapLesson(lesson as Lesson & { class?: Class; teacher?: Teacher; subject?: Subject })
+  )
 }
 
-async function findFirstAvailableSlot(classId: number, teacherId: number, room: string, weekType: 'even' | 'odd' | 'both' = 'both') {
-  for (let dayOfWeek = 1; dayOfWeek <= 5; dayOfWeek += 1) {
-    for (let period = 1; period <= 8; period += 1) {
-      try {
-        await ensureNoLessonConflict({ classId, teacherId, room, dayOfWeek, period, weekType })
-        return {
-          dayOfWeek,
-          period,
-          ...PERIOD_TIMES[period]
-        }
-      } catch {
-        // try next slot
-      }
+async function getDaysOrderedByClassLoad(classId: number): Promise<number[]> {
+  const counts = await Promise.all(
+    WEEK_DAYS.map((dayOfWeek) =>
+      Lesson.count({
+        where: { classId, dayOfWeek }
+      })
+    )
+  )
+
+  return [...WEEK_DAYS].sort((a, b) => {
+    const countA = counts[a - 1]
+    const countB = counts[b - 1]
+    return countA - countB || a - b
+  })
+}
+
+function buildPreferredDays(hoursPerWeek: number, orderedDays: number[]): number[] {
+  if (hoursPerWeek <= 0) return []
+  if (orderedDays.length === 0) return []
+
+  if (hoursPerWeek === 1) {
+    return [orderedDays[0]]
+  }
+
+  const result: number[] = []
+
+  if (hoursPerWeek <= orderedDays.length) {
+    const maxIndex = orderedDays.length - 1
+
+    for (let i = 0; i < hoursPerWeek; i += 1) {
+      const index = Math.round((i * maxIndex) / (hoursPerWeek - 1))
+      result.push(orderedDays[index])
+    }
+
+    return result
+  }
+
+  // Если часов больше, чем дней, сначала даём по одному часу на каждый день,
+  // потом повторяем цикл по дням.
+  while (result.length < hoursPerWeek) {
+    for (const day of orderedDays) {
+      if (result.length >= hoursPerWeek) break
+      result.push(day)
     }
   }
+
+  return result
+}
+
+async function hasSameSubjectForClassInDay(classId: number, subjectId: number, dayOfWeek: number) {
+  const sameSubjectCount = await Lesson.count({
+    where: {
+      classId,
+      subjectId,
+      dayOfWeek
+    }
+  })
+
+  return sameSubjectCount > 0
+}
+
+async function findAvailableSlotForDay(
+  classId: number,
+  teacherId: number,
+  subjectId: number,
+  room: string,
+  dayOfWeek: number,
+  weekType: 'even' | 'odd' | 'both' = 'both',
+  allowSameSubjectInDay = false
+) {
+  if (!allowSameSubjectInDay) {
+    const alreadyHasThisSubject = await hasSameSubjectForClassInDay(classId, subjectId, dayOfWeek)
+    if (alreadyHasThisSubject) {
+      return null
+    }
+  }
+
+  for (const period of PERIODS) {
+    try {
+      await ensureNoLessonConflict({
+        classId,
+        teacherId,
+        room,
+        dayOfWeek,
+        period,
+        weekType
+      })
+
+      return {
+        dayOfWeek,
+        period,
+        ...PERIOD_TIMES[period]
+      }
+    } catch {
+      // этот слот занят, пробуем следующий
+    }
+  }
+
+  return null
+}
+
+async function findBestAvailableSlot(
+  classId: number,
+  teacherId: number,
+  subjectId: number,
+  room: string,
+  preferredDay: number,
+  weekType: 'even' | 'odd' | 'both' = 'both'
+) {
+  // 1. Сначала пытаемся поставить в целевой день без повторения предмета в этот день
+  let slot = await findAvailableSlotForDay(
+    classId,
+    teacherId,
+    subjectId,
+    room,
+    preferredDay,
+    weekType,
+    false
+  )
+  if (slot) return slot
+
+  // 2. Потом пробуем остальные дни без повторения предмета в день
+  const orderedDays = await getDaysOrderedByClassLoad(classId)
+  for (const day of orderedDays) {
+    if (day === preferredDay) continue
+
+    slot = await findAvailableSlotForDay(
+      classId,
+      teacherId,
+      subjectId,
+      room,
+      day,
+      weekType,
+      false
+    )
+
+    if (slot) return slot
+  }
+
+  // 3. Если не получилось, разрешаем повтор того же предмета в один день
+  slot = await findAvailableSlotForDay(
+    classId,
+    teacherId,
+    subjectId,
+    room,
+    preferredDay,
+    weekType,
+    true
+  )
+  if (slot) return slot
+
+  // 4. Последняя попытка — любой день, даже если предмет уже есть в этот день
+  for (const day of orderedDays) {
+    if (day === preferredDay) continue
+
+    slot = await findAvailableSlotForDay(
+      classId,
+      teacherId,
+      subjectId,
+      room,
+      day,
+      weekType,
+      true
+    )
+
+    if (slot) return slot
+  }
+
   return null
 }
 
@@ -76,6 +235,7 @@ export class ScheduleController {
       if (req.query.classId) where.classId = Number(req.query.classId)
       if (req.query.teacherId) where.teacherId = Number(req.query.teacherId)
       if (req.query.dayOfWeek) where.dayOfWeek = Number(req.query.dayOfWeek)
+
       res.json(await fetchLessons(where))
     } catch (error) {
       next(error)
@@ -156,6 +316,7 @@ export class ScheduleController {
 
       await ensureNoLessonConflict({ ...payload, excludeId: lesson.id })
       await lesson.update(payload)
+
       const result = await fetchLessons({ id: lesson.id })
       res.json(result[0])
     } catch (error) {
@@ -167,6 +328,7 @@ export class ScheduleController {
     try {
       const lesson = await Lesson.findByPk(Number(req.params.id))
       if (!lesson) throw new ApiError(404, 'Занятие не найдено')
+
       await lesson.destroy()
       res.json({ message: 'Занятие удалено' })
     } catch (error) {
@@ -178,11 +340,18 @@ export class ScheduleController {
     try {
       const classId = Number(req.params.classId)
       const replaceExisting = req.body?.replaceExisting === true
+
       const classModel = await Class.findByPk(classId)
       if (!classModel) throw new ApiError(404, 'Класс не найден')
 
-      const loads = await TeachingLoad.findAll({ where: { classId, isActive: true }, order: [['id', 'ASC']] })
-      if (loads.length === 0) throw new ApiError(400, 'Для класса не задана учебная нагрузка')
+      const loads = await TeachingLoad.findAll({
+        where: { classId, isActive: true },
+        order: [['id', 'ASC']]
+      })
+
+      if (loads.length === 0) {
+        throw new ApiError(400, 'Для класса не задана учебная нагрузка')
+      }
 
       if (replaceExisting) {
         await Lesson.destroy({ where: { classId } })
@@ -190,6 +359,7 @@ export class ScheduleController {
 
       const existingLessons = await Lesson.findAll({ where: { classId } })
       const existingKeyCount = new Map<string, number>()
+
       for (const lesson of existingLessons) {
         const key = `${lesson.classId}:${lesson.teacherId}:${lesson.subjectId}`
         existingKeyCount.set(key, (existingKeyCount.get(key) || 0) + 1)
@@ -203,10 +373,28 @@ export class ScheduleController {
         const existingCount = existingKeyCount.get(key) || 0
         const missingCount = Math.max(0, load.hoursPerWeek - existingCount)
 
+        if (missingCount === 0) continue
+
+        const orderedDays = await getDaysOrderedByClassLoad(load.classId)
+        const preferredDays = buildPreferredDays(missingCount, orderedDays)
+
         for (let index = 0; index < missingCount; index += 1) {
-          const slot = await findFirstAvailableSlot(load.classId, load.teacherId, load.room || 'Кабинет не указан')
+          const preferredDay = preferredDays[index]
+
+          const slot = await findBestAvailableSlot(
+            load.classId,
+            load.teacherId,
+            load.subjectId,
+            load.room || 'Кабинет не указан',
+            preferredDay,
+            'both'
+          )
+
           if (!slot) {
-            skipped.push({ loadId: load.id, reason: 'Свободный слот не найден' })
+            skipped.push({
+              loadId: load.id,
+              reason: 'Свободный слот не найден'
+            })
             break
           }
 
@@ -227,11 +415,18 @@ export class ScheduleController {
         }
       }
 
-      const createdLessons = createdLessonIds.length > 0 ? await fetchLessons({ id: { [Op.in]: createdLessonIds } }) : []
+      const createdLessons =
+        createdLessonIds.length > 0
+          ? await fetchLessons({ id: { [Op.in]: createdLessonIds } })
+          : []
+
       const schedule = await fetchLessons({ classId })
 
       res.json({
-        message: createdLessons.length > 0 ? 'Занятия автоматически добавлены в сетку класса' : 'Новые занятия не были созданы',
+        message:
+          createdLessons.length > 0
+            ? 'Занятия автоматически добавлены в сетку класса'
+            : 'Новые занятия не были созданы',
         createdLessons,
         skipped,
         schedule
